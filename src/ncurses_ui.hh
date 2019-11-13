@@ -17,8 +17,6 @@ namespace Kakoune
 
 struct DisplayAtom;
 
-struct NCursesWin;
-
 class NCursesUI : public UserInterface, public Singleton<NCursesUI>
 {
 public:
@@ -104,10 +102,17 @@ private:
         void draw(Palette& palette, ConstArrayView<DisplayAtom> atoms,
                   const Face& default_face);
 
-        explicit operator bool() const { return win; }
+        explicit operator bool() const { return not lines.empty(); }
 
-        NCursesWin* win = nullptr;
-        int m_active_pair = -1;
+        struct Atom
+        {
+            String text;
+            Face face;
+        };
+        Vector<Vector<Atom>> lines;
+        DisplayCoord cursor;
+
+        void clear_line();
     };
 
     Window m_window;

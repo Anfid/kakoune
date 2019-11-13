@@ -28,95 +28,107 @@ namespace Kakoune
 using std::min;
 using std::max;
 
-struct NCursesWin : WINDOW {};
+void endwin()
+{
+    fputs("\033[?1049l", stdout);
+    fflush(stdout);
+}
+
+static void set_cursor_pos(DisplayCoord coord)
+{
+    printf("\033[%d;%dH", (int)coord.line + 1, (int)coord.column + 1);
+}
 
 void NCursesUI::Window::create(const DisplayCoord& p, const DisplayCoord& s)
 {
     pos = p;
     size = s;
-    win = (NCursesWin*)newpad((int)size.line, (int)size.column);
+    lines.resize((int)size.line);
 }
 
 void NCursesUI::Window::destroy()
 {
-    delwin(win);
-    win = nullptr;
     pos = DisplayCoord{};
     size = DisplayCoord{};
+    lines.clear();
 }
 
 void NCursesUI::Window::refresh(bool force)
 {
-    if (not win)
+    if (lines.empty())
         return;
 
-    if (force)
-        redrawwin(win);
+    auto set_color = [](bool fg, const Color& color) {
+        if (color.color == Color::RGB)
+        {
+            printf("\033[%d;2;%d;%d;%dm", fg ? 38 : 48, color.r, color.g, color.b);
+            return;
+        }
+        constexpr int fg_table[]{ 39, 30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97 };
+        constexpr int bg_table[]{ 49, 40, 41, 42, 43, 44, 45, 46, 47, 100, 101, 102, 103, 104, 105, 106, 107 };
+        printf("\033[%dm", (fg ? fg_table : bg_table)[(int)(char)color.color]);
+    };
 
-    DisplayCoord max_pos = pos + size - DisplayCoord{1,1};
-    pnoutrefresh(win, 0, 0, (int)pos.line, (int)pos.column,
-                 (int)max_pos.line, (int)max_pos.column);
+    DisplayCoord cursor_pos = pos;
+    for (auto& line : lines)
+    {
+        set_cursor_pos(cursor_pos);
+        for (auto& atom : line)
+        {
+            set_color(true, atom.face.fg);
+            set_color(false, atom.face.bg);
+            fputs(atom.text.c_str(), stdout);
+        }
+        ++cursor_pos.line;
+    }
+    fflush(stdout);
 }
 
 void NCursesUI::Window::move_cursor(DisplayCoord coord)
 {
-    wmove(win, (int)coord.line, (int)coord.column);
+    cursor = coord;
+}
+
+void NCursesUI::Window::clear_line()
+{
+    auto& line = lines[(int)cursor.line];
+    auto it = line.begin();
+    ColumnCount column = 0;
+    for (; it != line.end() and column < cursor.column; ++it)
+        column += it->text.column_length();
+
+    line.erase(it, line.end());
+    if (column > cursor.column)
+    {
+        auto& text = line.back().text;
+        auto new_length = text.column_length() - (column - cursor.column);
+        text.resize(text.byte_count_to(new_length), 0);
+    }
 }
 
 void NCursesUI::Window::draw(Palette& palette, ConstArrayView<DisplayAtom> atoms,
                              const Face& default_face)
 {
-    auto add_str = [&](StringView str) { waddnstr(win, str.begin(), (int)str.length()); };
-
-    auto set_face = [&](Face face) {
-        if (m_active_pair != -1)
-            wattroff(win, COLOR_PAIR(m_active_pair));
-
-        face = merge_faces(default_face, face);
-
-        if (face.fg != Color::Default or face.bg != Color::Default)
-        {
-            m_active_pair = palette.get_color_pair(face);
-            wattron(win, COLOR_PAIR(m_active_pair));
-        }
-
-        auto set_attribute = [&](Attribute attr, int nc_attr) {
-            (face.attributes & attr) ?  wattron(win, nc_attr) : wattroff(win, nc_attr);
-        };
-
-        set_attribute(Attribute::Underline, A_UNDERLINE);
-        set_attribute(Attribute::Reverse, A_REVERSE);
-        set_attribute(Attribute::Blink, A_BLINK);
-        set_attribute(Attribute::Bold, A_BOLD);
-        set_attribute(Attribute::Dim, A_DIM);
-        #if defined(A_ITALIC)
-        set_attribute(Attribute::Italic, A_ITALIC);
-        #endif
-    };
-
-    ColumnCount column = getcurx(win);
+    clear_line();
     for (const DisplayAtom& atom : atoms)
     {
         StringView content = atom.content();
         if (content.empty())
             continue;
 
-        set_face(atom.face);
+        auto face = merge_faces(default_face, atom.face);
         if (content.back() == '\n')
         {
-            add_str(content.substr(0, content.length()-1));
-            waddch(win, ' ');
+            lines[(int)cursor.line].push_back({content.substr(0, content.length()-1).str(), face});
+            lines[(int)cursor.line].push_back({" ", face});
         }
         else
-            add_str(content);
-        column += content.column_length();
+            lines[(int)cursor.line].push_back({content.str(), face});
+        cursor.column += content.column_length();
     }
 
-    if (column < size.column)
-    {
-        wbkgdset(win, COLOR_PAIR(palette.get_color_pair(default_face)));
-        wclrtoeol(win);
-    }
+    if (cursor.column < size.column)
+        lines[(int)cursor.line].push_back({String(' ', size.column - cursor.column), default_face});
 }
 
 constexpr int NCursesUI::default_shift_function_key;
@@ -342,10 +354,13 @@ NCursesUI::NCursesUI()
 
     tcgetattr(STDIN_FILENO, &m_original_termios);
 
-    initscr();
-    curs_set(0);
-    start_color();
-    use_default_colors();
+    // initscr();
+    // curs_set(0);
+    // start_color();
+    // use_default_colors();
+    //     
+    fputs("\033[?1049h", stdout);
+    fflush(stdout);
 
     set_raw_mode();
     enable_mouse(true);
@@ -420,13 +435,10 @@ void NCursesUI::redraw(bool force)
 
     m_info.refresh(false);
 
-    Window screen{{}, static_cast<NCursesWin*>(newscr)};
     if (m_cursor.mode == CursorMode::Prompt)
-        screen.move_cursor({m_status_on_top ? 0 : m_dimensions.line, m_cursor.coord.column});
+        set_cursor_pos({m_status_on_top ? 0 : m_dimensions.line, m_cursor.coord.column});
     else
-        screen.move_cursor(m_cursor.coord + content_line_offset());
-
-    doupdate();
+        set_cursor_pos(m_cursor.coord + content_line_offset());
 }
 
 void NCursesUI::set_cursor(CursorMode mode, DisplayCoord coord)
@@ -550,8 +562,8 @@ void NCursesUI::check_resize(bool force)
 
     m_dimensions = DisplayCoord{ws.ws_row-1, ws.ws_col};
 
-    if (char* csr = tigetstr((char*)"csr"))
-        putp(tparm(csr, 0, ws.ws_row));
+    // if (char* csr = tigetstr((char*)"csr"))
+    //     putp(tparm(csr, 0, ws.ws_row));
 
     if (menu)
         menu_show(Vector<DisplayLine>(std::move(m_menu.items)),
@@ -1271,9 +1283,6 @@ void NCursesUI::set_ui_options(const Options& options)
         if (m_palette.set_change_colors(it == options.end() or
                                         (it->value == "yes" or it->value == "true")))
         {
-            m_window.m_active_pair = -1;
-            m_menu.m_active_pair = -1;
-            m_info.m_active_pair = -1;
         }
     }
 
